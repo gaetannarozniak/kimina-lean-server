@@ -146,24 +146,24 @@ async def run_checks(
                         "repl_uuid": uuid_hex,
                     },
                 )
-                logger.info(
-                    "[{}] Response for [bold magenta]{}[/bold magenta] body →\n{}",
-                    repl.uuid.hex[:8],
-                    snippet.id,
-                    json.dumps(resp.model_dump(exclude_none=True), indent=2),
-                )
+                # logger.info(
+                #     "[{}] Response for [bold magenta]{}[/bold magenta] body →\n{}",
+                #     repl.uuid.hex[:8],
+                #     snippet.id,
+                #     json.dumps(resp.model_dump(exclude_none=True), indent=2),
+                # )
                 return resp
             except Exception as e:
                 logger.exception("Snippet execution failed")
                 await manager.destroy_repl(repl)
                 raise HTTPException(500, str(e)) from e
             else:
-                logger.info(
-                    "[{}] Response for [bold magenta]{}[/bold magenta] body →\n{}",
-                    repl.uuid.hex[:8],
-                    snippet.id,
-                    json.dumps(resp.model_dump(exclude_none=True), indent=2),
-                )
+                # logger.info(
+                #     "[{}] Response for [bold magenta]{}[/bold magenta] body →\n{}",
+                #     repl.uuid.hex[:8],
+                #     snippet.id,
+                #     json.dumps(resp.model_dump(exclude_none=True), indent=2),
+                # )
                 await manager.release_repl(repl)
                 # TODO: Try catch everything DB related
                 if db.connected:

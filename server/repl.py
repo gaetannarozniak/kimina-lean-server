@@ -172,32 +172,52 @@ class Repl:
 
     @staticmethod
     def _sum_cpu_times(proc: psutil.Process) -> float:
-        total = proc.cpu_times().user + proc.cpu_times().system
-        for c in proc.children(recursive=True):
-            t = c.cpu_times()
-            total += t.user + t.system
-        return float(total)
+        try:
+            total = proc.cpu_times().user + proc.cpu_times().system
+            for c in proc.children(recursive=True):
+                t = c.cpu_times()
+                total += t.user + t.system
+            return float(total)
+        except psutil.NoSuchProcess:
+            # Process died, return 0
+            return 0.0
 
     async def _cpu_monitor(self) -> None:
         while self.is_running and self._ps_proc and self._loop:
             await asyncio.sleep(1)
-            now = self._loop.time()
+            try:
+                now = self._loop.time()
 
-            cur_cpu = self._sum_cpu_times(self._ps_proc)
-            delta_cpu = cur_cpu - self._last_cpu_time
-            delta_t = now - self._last_check
-            usage_pct = (delta_cpu / delta_t) * 100
-            self._cpu_max = max(self._cpu_max, usage_pct)
-            self._last_cpu_time = cur_cpu
-            self._last_check = now
+                cur_cpu = self._sum_cpu_times(self._ps_proc)
+                delta_cpu = cur_cpu - self._last_cpu_time
+                delta_t = now - self._last_check
+                usage_pct = (delta_cpu / delta_t) * 100
+                self._cpu_max = max(self._cpu_max, usage_pct)
+                self._last_cpu_time = cur_cpu
+                self._last_check = now
+            except psutil.NoSuchProcess:
+                # Process died, exit monitoring gracefully
+                logger.debug(f"[{self.uuid.hex[:8]}] CPU monitor: process no longer exists")
+                break
+            except Exception as e:
+                logger.warning(f"[{self.uuid.hex[:8]}] CPU monitor error: {e}")
+                break
 
     async def _mem_monitor(self) -> None:
         while self.is_running and self._ps_proc:
             await asyncio.sleep(1)
-            total = self._ps_proc.memory_info().rss
-            for child in self._ps_proc.children(recursive=True):
-                total += child.memory_info().rss
-            self._mem_max = max(self._mem_max, total)
+            try:
+                total = self._ps_proc.memory_info().rss
+                for child in self._ps_proc.children(recursive=True):
+                    total += child.memory_info().rss
+                self._mem_max = max(self._mem_max, total)
+            except psutil.NoSuchProcess:
+                # Process died, exit monitoring gracefully
+                logger.debug(f"[{self.uuid.hex[:8]}] Memory monitor: process no longer exists")
+                break
+            except Exception as e:
+                logger.warning(f"[{self.uuid.hex[:8]}] Memory monitor error: {e}")
+                break
 
     @property
     def is_running(self) -> bool:
@@ -295,11 +315,28 @@ class Repl:
         elapsed = loop.time() - start
 
         logger.debug("Raw response from REPL: %r", raw)
+
+        # Check if REPL died and returned empty response
+        if not raw:
+            if self.proc.returncode is not None:
+                logger.error(
+                    "REPL process died with return code %d (likely OOM or crash)",
+                    self.proc.returncode
+                )
+                raise ReplError(
+                    f"REPL process died with return code {self.proc.returncode}. "
+                    f"This is likely due to exceeding the {self.max_memory_bytes // (1024*1024)}MB memory limit "
+                    f"or a crash in the Lean code."
+                )
+            else:
+                logger.error("REPL returned empty response but process still running")
+                raise ReplError("REPL returned empty response")
+
         try:
             resp: CommandResponse | Error = json.loads(raw)
         except json.JSONDecodeError:
             logger.error("JSON decode error: %r", raw)
-            raise ReplError("JSON decode error")
+            raise ReplError(f"JSON decode error. Raw response: {raw[:500]}")
 
         self.error_file.seek(0)
         err = self.error_file.read().strip()

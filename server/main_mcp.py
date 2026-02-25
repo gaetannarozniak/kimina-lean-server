@@ -1,11 +1,13 @@
-import asyncio
+from anyio import BrokenResourceError, ClosedResourceError
 from contextlib import asynccontextmanager
+import asyncio
 import logging
 from pathlib import Path
 from uuid import uuid4
-from kimina_client import Infotree, ReplResponse, Snippet
+from kimina_client import ReplResponse, Snippet
 from fastmcp import FastMCP
-import os
+from fastapi import HTTPException
+from starlette.requests import ClientDisconnect
 import subprocess
 from typing import Annotated, Optional
 
@@ -14,10 +16,11 @@ from pydantic import Field
 from server.manager import Manager
 from server.routers.check import run_checks
 from server.settings import Settings
+from server.errors import ReplError, LeanError
 
 logger = logging.getLogger("kimina-client")
 
-settings = Settings()
+settings = Settings(max_repl_mem=32)
 lean_directory = Path.home().resolve() / "model_generated_files"
 
 MATHLIB_DIR = (Path.cwd() / "mathlib4").resolve(strict = True)
@@ -46,22 +49,87 @@ async def lean_run_code(lean_code: str):
     """
     Run a Lean snippet provided as a string and return the Lean4 diagnostics.
     """
-    global manager
-    snippet = Snippet(id=str(uuid4()), code=lean_code)
-    results = await run_checks(
-        snippets=[snippet],
-        timeout=120.0,
-        debug=False,
-        manager=manager,
-        reuse=True,
-        infotree=None,
-    )
-    repl_response : ReplResponse = results[0]
-    is_valid = repl_response.analyze().status == "valid"
-    return {
-        "repl_response": repl_response,
-        "is_valid": is_valid,
-    }
+    try:
+        global manager
+        snippet = Snippet(id=str(uuid4()), code=lean_code)
+        results = await run_checks(
+            snippets=[snippet],
+            timeout=120.0,
+            debug=False,
+            manager=manager,
+            reuse=True,
+            infotree=None,
+        )
+        repl_response : ReplResponse = results[0]
+        is_valid = repl_response.analyze().status == "valid"
+        return {
+            "repl_response": repl_response,
+            "is_valid": is_valid,
+        }
+    except asyncio.CancelledError:
+        logger.warning("Task was cancelled (likely client disconnect)")
+        return {
+            "repl_response": ReplResponse(
+                id=str(uuid4()),
+                error="Task cancelled - client may have disconnected",
+            ),
+            "is_valid": False,
+        }
+    except TimeoutError:
+        logger.error("REPL timeout in lean_run_code")
+        return {
+            "repl_response": ReplResponse(
+                id=str(uuid4()),
+                error="Lean REPL command timed out after 120 seconds",
+                time=120.0,
+            ),
+            "is_valid": False,
+        }
+    except ReplError as e:
+        logger.error(f"REPL error in lean_run_code: {e}")
+        return {
+            "repl_response": ReplResponse(
+                id=str(uuid4()),
+                error=f"REPL process error: {str(e)}. The REPL may have crashed or exceeded memory limits.",
+            ),
+            "is_valid": False,
+        }
+    except LeanError as e:
+        logger.error(f"Lean error in lean_run_code: {e}")
+        return {
+            "repl_response": ReplResponse(
+                id=str(uuid4()),
+                error=f"Lean execution error: {str(e)}",
+            ),
+            "is_valid": False,
+        }
+    except HTTPException as e:
+        logger.error(f"HTTP error in lean_run_code: {e.status_code} - {e.detail}")
+        return {
+            "repl_response": ReplResponse(
+                id=str(uuid4()),
+                error=f"Error: {e.detail}",
+            ),
+            "is_valid": False,
+        }
+    except (BrokenResourceError, ClosedResourceError) as e:
+        logger.warning(f"Resource error in lean_run_code (client likely disconnected): {e}")
+        return {
+            "repl_response": ReplResponse(
+                id=str(uuid4()),
+                error="Connection closed - client may have disconnected",
+            ),
+            "is_valid": False,
+        }
+    except Exception as e:
+        logger.exception(f"Unexpected error in lean_run_code: {e}")
+        return {
+            "repl_response": ReplResponse(
+                id=str(uuid4()),
+                error=f"Unexpected error: {str(e)}",
+            ),
+            "is_valid": False,
+        }
 
 @mcp.tool()
 async def lean_write_file(
