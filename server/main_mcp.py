@@ -8,7 +8,7 @@ from kimina_client import ReplResponse, Snippet
 from fastmcp import FastMCP
 from fastapi import HTTPException
 from starlette.requests import ClientDisconnect
-import subprocess
+import time
 from typing import Annotated, Optional
 
 from pydantic import Field
@@ -32,24 +32,9 @@ manager = Manager(
     init_repls=settings.init_repls,
 )
 
-@asynccontextmanager
-async def app_lifespan(server: FastMCP):
-    logger.info("Starting up: Importing Mathlib...")
-    await lean_run_code("import Mathlib")
-    logger.info("Mathlib cached!")
-    
-    yield  
-    
-    logger.info("Shutting down...")
-
-mcp = FastMCP("Kimina MCP", lifespan=app_lifespan)
-
-@mcp.tool()
-async def lean_run_code(lean_code: str):
-    """
-    Run a Lean snippet provided as a string and return the Lean4 diagnostics.
-    """
+async def _run_lean_code(lean_code: str):
     try:
+        t = time.time()
         global manager
         snippet = Snippet(id=str(uuid4()), code=lean_code)
         results = await run_checks(
@@ -62,9 +47,19 @@ async def lean_run_code(lean_code: str):
         )
         repl_response : ReplResponse = results[0]
         is_valid = repl_response.analyze().status == "valid"
+        print(f"Time for running a Lean snippet: {time.time() - t}")
         return {
             "repl_response": repl_response,
             "is_valid": is_valid,
+        }
+    except ClientDisconnect:
+        logger.warning("Client disconnected during request")
+        return {
+            "repl_response": ReplResponse(
+                id=str(uuid4()),
+                error="Client disconnected",
+            ),
+            "is_valid": False,
         }
     except asyncio.CancelledError:
         logger.warning("Task was cancelled (likely client disconnect)")
@@ -131,6 +126,38 @@ async def lean_run_code(lean_code: str):
             "is_valid": False,
         }
 
+async def _event_loop_lag_monitor(interval: float = 0.2, warn_threshold: float = 0.05) -> None:
+    """Periodically measures event loop lag. Logs a warning whenever the loop
+    was blocked longer than warn_threshold seconds between two sleep wakeups."""
+    while True:
+        t0 = time.monotonic()
+        await asyncio.sleep(interval)
+        lag = time.monotonic() - t0 - interval
+        if lag > warn_threshold:
+            logger.warning(f"[event-loop] blocked for {lag:.3f}s")
+
+@asynccontextmanager
+async def app_lifespan(server: FastMCP):
+    logger.info("Starting up: Importing Mathlib...")
+    await _run_lean_code("import Mathlib")
+    logger.info("Mathlib cached!")
+
+    lag_monitor_task = asyncio.create_task(_event_loop_lag_monitor())
+
+    yield
+
+    lag_monitor_task.cancel()
+    logger.info("Shutting down...")
+
+mcp = FastMCP("Kimina MCP", lifespan=app_lifespan)
+
+@mcp.tool()
+async def lean_run_code(lean_code: str):
+    """
+    Run a Lean snippet provided as a string and return the Lean4 diagnostics.
+    """
+    return await _run_lean_code(lean_code)
+
 @mcp.tool()
 async def lean_write_file(
     code: Annotated[str, Field(description="Lean code, the content of the file")],
@@ -139,18 +166,29 @@ async def lean_write_file(
 ) -> str:
     """Write a Lean file"""
     global lean_directory
+    t0 = time.monotonic()
 
     if not file_name.endswith(".lean"):
         file_name += ".lean"
 
+    t1 = time.monotonic()
     lean_directory.mkdir(parents=True, exist_ok=True)
+    t2 = time.monotonic()
+
     file_path = lean_directory / trajectory_id / file_name
 
     if not "model_generated_files" in str(file_path):
         return f"Path to the file doesn't contain model_generated_files: {file_path}"
     try:
+        t3 = time.monotonic()
         file_path.parent.mkdir(parents=True, exist_ok=True)
+        t4 = time.monotonic()
         file_path.write_text(code, encoding="utf-8")
+        t5 = time.monotonic()
+        logger.info(
+            f"[lean_write_file] total={t5-t0:.3f}s | "
+            f"mkdir_base={t2-t1:.3f}s | mkdir_traj={t4-t3:.3f}s | write={t5-t4:.3f}s"
+        )
         return f"Successfully wrote to Lean project: {file_path.absolute()}"
     except Exception as e:
         return f"Failed to write to project: {str(e)}"
@@ -177,7 +215,7 @@ async def lean_check_file(absolute_file_path: str):
         return error_return(f"The provided path {file_path} is not in the correct directory: {lean_directory}")
     with open(file_path, "r") as f:
         lean_code = f.read()
-    return await lean_run_code(lean_code)
+    return await _run_lean_code(lean_code)
 
 @mcp.tool()
 async def rg_in_mathlib(pattern: str, file_glob_pattern: Optional[str] = None):
@@ -209,19 +247,30 @@ async def rg_in_mathlib(pattern: str, file_glob_pattern: Optional[str] = None):
         ".",
     ])
 
-    mathlib_path = str(MATHLIB_DIR)
-
     try:
-        rg = subprocess.Popen(cmd, cwd=mathlib_path, text=True, stdout=subprocess.PIPE)
-        head = subprocess.Popen(["head", "-n", str(max_matches)], stdin=rg.stdout, stdout=subprocess.PIPE, text=True)
-        rg.stdout.close()
-        output, _ = head.communicate()
-        
-        if not output.strip():
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            cwd=str(MATHLIB_DIR),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        assert proc.stdout is not None
+
+        lines = []
+        while len(lines) < max_matches:
+            line = await proc.stdout.readline()
+            if not line:
+                break
+            lines.append(line.decode())
+
+        proc.kill()
+        await proc.wait()
+
+        if not lines:
             return f"No matches found for pattern: {pattern}"
-            
-        return output
-        
+
+        return "".join(lines)
+
     except Exception as e:
         return f"Error running ripgrep: {str(e)}"
 
