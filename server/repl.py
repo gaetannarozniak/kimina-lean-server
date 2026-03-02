@@ -4,6 +4,7 @@ import os
 import platform
 import signal
 import tempfile
+import threading
 from asyncio.subprocess import Process
 from datetime import datetime
 from uuid import UUID, uuid4
@@ -90,8 +91,9 @@ class Repl:
         self._mem_max: int = 0
 
         self._ps_proc: psutil.Process | None = None
-        self._cpu_task: asyncio.Task[None] | None = None
-        self._mem_task: asyncio.Task[None] | None = None
+        self._stop_event: threading.Event = threading.Event()
+        self._cpu_task: threading.Thread | None = None
+        self._mem_task: threading.Thread | None = None
 
     @classmethod
     async def create(cls, header: str, max_repl_uses: int, max_repl_mem: int) -> "Repl":
@@ -165,33 +167,32 @@ class Repl:
 
         self._cpu_max = 0.0
         self._mem_max = 0
-        self._cpu_task = self._loop.create_task(self._cpu_monitor())
-        self._mem_task = self._loop.create_task(self._mem_monitor())
+        self._stop_event.clear()
+        self._cpu_task = threading.Thread(target=self._cpu_monitor, daemon=True, name=f"cpu-{self.uuid.hex[:8]}")
+        self._mem_task = threading.Thread(target=self._mem_monitor, daemon=True, name=f"mem-{self.uuid.hex[:8]}")
+        self._cpu_task.start()
+        self._mem_task.start()
 
         logger.info(f"\\[{self.uuid.hex[:8]}] Started")
 
     @staticmethod
     def _sum_cpu_times(proc: psutil.Process) -> float:
         try:
-            total = proc.cpu_times().user + proc.cpu_times().system
-            for c in proc.children(recursive=True):
-                t = c.cpu_times()
-                total += t.user + t.system
-            return float(total)
+            t = proc.cpu_times()
+            return float(t.user + t.system)
         except psutil.NoSuchProcess:
-            # Process died, return 0
             return 0.0
 
-    async def _cpu_monitor(self) -> None:
-        while self.is_running and self._ps_proc and self._loop:
-            await asyncio.sleep(1)
+    def _cpu_monitor(self) -> None:
+        while not self._stop_event.wait(timeout=1.0):
+            if not self._ps_proc:
+                break
             try:
-                now = self._loop.time()
-
+                now = self._loop.time() if self._loop else 0.0
                 cur_cpu = self._sum_cpu_times(self._ps_proc)
                 delta_cpu = cur_cpu - self._last_cpu_time
                 delta_t = now - self._last_check
-                usage_pct = (delta_cpu / delta_t) * 100
+                usage_pct = (delta_cpu / delta_t) * 100 if delta_t > 0 else 0.0
                 self._cpu_max = max(self._cpu_max, usage_pct)
                 self._last_cpu_time = cur_cpu
                 self._last_check = now
@@ -203,14 +204,12 @@ class Repl:
                 logger.warning(f"[{self.uuid.hex[:8]}] CPU monitor error: {e}")
                 break
 
-    async def _mem_monitor(self) -> None:
-        while self.is_running and self._ps_proc:
-            await asyncio.sleep(1)
+    def _mem_monitor(self) -> None:
+        while not self._stop_event.wait(timeout=1.0):
+            if not self._ps_proc:
+                break
             try:
-                total = self._ps_proc.memory_info().rss
-                for child in self._ps_proc.children(recursive=True):
-                    total += child.memory_info().rss
-                self._mem_max = max(self._mem_max, total)
+                self._mem_max = max(self._mem_max, self._ps_proc.memory_info().rss)
             except psutil.NoSuchProcess:
                 # Process died, exit monitoring gracefully
                 logger.debug(f"[{self.uuid.hex[:8]}] Memory monitor: process no longer exists")
@@ -384,10 +383,7 @@ class Repl:
             self.proc.stdin.close()
             os.killpg(os.getpgid(self.proc.pid), signal.SIGKILL)
             await self.proc.wait()
-            if self._cpu_task:
-                self._cpu_task.cancel()
-            if self._mem_task:
-                self._mem_task.cancel()
+            self._stop_event.set()  # signals both monitor threads to exit
 
             if db.connected:
                 await prisma.repl.update(
