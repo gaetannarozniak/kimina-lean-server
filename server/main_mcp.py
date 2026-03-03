@@ -166,29 +166,18 @@ async def lean_write_file(
 ) -> str:
     """Write a Lean file"""
     global lean_directory
-    t0 = time.monotonic()
 
     if not file_name.endswith(".lean"):
         file_name += ".lean"
 
-    t1 = time.monotonic()
     lean_directory.mkdir(parents=True, exist_ok=True)
-    t2 = time.monotonic()
-
     file_path = lean_directory / trajectory_id / file_name
 
     if not "model_generated_files" in str(file_path):
         return f"Path to the file doesn't contain model_generated_files: {file_path}"
     try:
-        t3 = time.monotonic()
         file_path.parent.mkdir(parents=True, exist_ok=True)
-        t4 = time.monotonic()
         file_path.write_text(code, encoding="utf-8")
-        t5 = time.monotonic()
-        logger.info(
-            f"[lean_write_file] total={t5-t0:.3f}s | "
-            f"mkdir_base={t2-t1:.3f}s | mkdir_traj={t4-t3:.3f}s | write={t5-t4:.3f}s"
-        )
         return f"Successfully wrote to Lean project: {file_path.absolute()}"
     except Exception as e:
         return f"Failed to write to project: {str(e)}"
