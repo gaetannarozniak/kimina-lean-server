@@ -156,7 +156,7 @@ async def run_checks(
             except Exception as e:
                 logger.exception("Snippet execution failed")
                 await manager.destroy_repl(repl)
-                raise HTTPException(500, str(e)) from e
+                return ReplResponse(id=snippet.id, error=str(e))
             else:
                 # logger.info(
                 #     "[{}] Response for [bold magenta]{}[/bold magenta] body →\n{}",
