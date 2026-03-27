@@ -146,6 +146,13 @@ class Repl:
             # The adjustment variables are the maximum number of REPLs and the timeout.
             # See https://github.com/leanprover-community/repl/issues/91
 
+            # Lower CPU priority of Lean subprocesses so the Python asyncio event loop
+            # (which handles all HTTP connections and timeouts) always gets scheduled
+            # even when all CPU cores are saturated with concurrent Lean tactics.
+            # Without this, 191 REPLs running nlinarith/polyrith can starve the server
+            # process for 10+ minutes, causing all reward workers to lose connection.
+            os.nice(10)
+
             os.setsid()
 
         self.proc = await asyncio.create_subprocess_exec(
