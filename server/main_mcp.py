@@ -214,7 +214,7 @@ def _extract_candidate_lemma_names(lean_code: str) -> list[str]:
 
 def _build_verification_snippet(candidates: list[str]) -> str:
     """Build a Lean #eval snippet that filters a list of name candidates to those
-    that are actually declared in a Mathlib module."""
+    that are theorem/lemma declarations (from Mathlib, Lean core, Std, etc.)."""
     if not candidates:
         return '\n#eval ("LEAN_LEMMAS_V1=" : String)\n'
     lean_list = ", ".join(f"`{name}" for name in candidates)
@@ -223,11 +223,12 @@ open Lean in
 #eval show CoreM String from do
   let env ← getEnv
   let candidates : List Name := [{lean_list}]
-  let mathlibNames := candidates.filter (fun n =>
-    match env.getModuleIdxFor? n with
+  let lemmaNames := candidates.filter (fun n =>
+    match env.find? n with
     | none => false
-    | some idx => (env.header.moduleNames[idx.toNat]!).toString.startsWith "Mathlib")
-  return "LEAN_LEMMAS_V1=" ++ String.intercalate "," (mathlibNames.map Name.toString)
+    | some (.thmInfo _) => true
+    | _ => false)
+  return "LEAN_LEMMAS_V1=" ++ String.intercalate "," (lemmaNames.map Name.toString)
 """
 
 
