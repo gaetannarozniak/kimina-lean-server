@@ -189,9 +189,9 @@ def _extract_candidate_lemma_names(lean_code: str) -> list[str]:
     Uses regex to find:
     - Qualified identifiers like Nat.add_comm, Finset.sum_comm (Namespace.name patterns)
     - Names inside tactic bracket lists: rw [X, ← Y], simp [X, Y], simp only [X]
+    - Names in tactic application positions: exact X, apply X, have h := X, etc.
 
-    False positives (type names, Lean core names, etc.) are removed later by
-    Lean's environment lookup in _build_verification_snippet.
+    False positives (keywords, types, etc.) are removed later by the Lean thmInfo check.
     """
     candidates: set[str] = set()
 
@@ -208,6 +208,20 @@ def _extract_candidate_lemma_names(lean_code: str) -> list[str]:
             m = re.match(r'^([A-Za-z_][A-Za-z0-9_\']*(?:\.[A-Za-z_\'][A-Za-z0-9_\']*)*)', item)
             if m and m.group(1):
                 candidates.add(m.group(1))
+
+    # Names in tactic application positions (catches unqualified names like sq_nonneg).
+    # False positives (keywords like `by`, `fun`, types) are filtered by the thmInfo check.
+    ident = r'([A-Za-z_][A-Za-z0-9_\']*(?:\.[A-Za-z_\'][A-Za-z0-9_\']*)*)'
+    for pattern in [
+        rf'\bexact\s+{ident}',
+        rf'\bapply\s+{ident}',
+        rf'\brefine\s+{ident}',
+        rf'\buse\s+{ident}',
+        rf':=\s+{ident}',       # have h : T := lemma_name ...
+        rf'\bfrom\s+{ident}',
+    ]:
+        for m in re.finditer(pattern, lean_code):
+            candidates.add(m.group(1))
 
     return list(candidates)
 
