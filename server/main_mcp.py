@@ -2,6 +2,7 @@ from anyio import BrokenResourceError, ClosedResourceError
 from contextlib import asynccontextmanager
 import asyncio
 import logging
+import re
 from pathlib import Path
 from uuid import uuid4
 from kimina_client import ReplResponse, Snippet
@@ -182,9 +183,86 @@ async def lean_write_file(
     except Exception as e:
         return f"Failed to write to project: {str(e)}"
     
+def _extract_candidate_lemma_names(lean_code: str) -> list[str]:
+    """Extract candidate Mathlib lemma names explicitly written in Lean source code.
+
+    Uses regex to find:
+    - Qualified identifiers like Nat.add_comm, Finset.sum_comm (Namespace.name patterns)
+    - Names inside tactic bracket lists: rw [X, ← Y], simp [X, Y], simp only [X]
+
+    False positives (type names, Lean core names, etc.) are removed later by
+    Lean's environment lookup in _build_verification_snippet.
+    """
+    candidates: set[str] = set()
+
+    # Qualified identifiers that start with an uppercase namespace component.
+    # Matches: Nat.add_comm, List.map_id, Finset.sum_comm, Nat.Coprime.pow_dvd_of_pow_dvd …
+    for m in re.finditer(r'\b([A-Z][A-Za-z0-9_]*(?:\.[A-Za-z_\'][A-Za-z0-9_\']*)+)\b', lean_code):
+        candidates.add(m.group(1))
+
+    # Names inside [...] bracket lists (rw, simp, simp only, …).
+    # Also handles the ← reverse-rewrite prefix.
+    for bracket_content in re.findall(r'\[([^\]]*)\]', lean_code):
+        for item in bracket_content.split(','):
+            item = item.strip().lstrip('←').strip()
+            m = re.match(r'^([A-Za-z_][A-Za-z0-9_\']*(?:\.[A-Za-z_\'][A-Za-z0-9_\']*)*)', item)
+            if m and m.group(1):
+                candidates.add(m.group(1))
+
+    return list(candidates)
+
+
+def _build_verification_snippet(candidates: list[str]) -> str:
+    """Build a Lean #eval snippet that filters a list of name candidates to those
+    that are actually declared in a Mathlib module."""
+    if not candidates:
+        return '\n#eval ("LEAN_LEMMAS_V1=" : String)\n'
+    lean_list = ", ".join(f"`{name}" for name in candidates)
+    return f"""
+open Lean in
+#eval show CoreM String from do
+  let env ← getEnv
+  let candidates : List Name := [{lean_list}]
+  let mathlibNames := candidates.filter (fun n =>
+    match env.getModuleIdxFor? n with
+    | none => false
+    | some idx => (env.header.moduleNames[idx.toNat]!).toString.startsWith "Mathlib")
+  return "LEAN_LEMMAS_V1=" ++ String.intercalate "," (mathlibNames.map Name.toString)
+"""
+
+
+def _parse_lemmas_from_response(repl_response: ReplResponse) -> list[str]:
+    """Extract Mathlib lemma names from a REPL response containing #eval output.
+
+    Returns a sorted, deduplicated list of fully-qualified Lean declaration names.
+    """
+    if not repl_response.response:
+        return []
+    messages = repl_response.response.get("messages", [])
+    lemmas: set[str] = set()
+    for msg in messages:
+        data = msg.get("data", "")
+        m = re.search(r'LEAN_LEMMAS_V1=([^"]*)', data)
+        if m:
+            content = m.group(1).strip().strip(',')
+            if content:
+                lemmas.update(n for n in content.split(',') if n.strip())
+    return sorted(lemmas)
+
+
 @mcp.tool()
-async def lean_check_file(absolute_file_path: str):
-    "Return diagnostics for a given lean file, provided its absolute path"
+async def lean_check_file(
+    absolute_file_path: str,
+    return_lemmas_list: bool = False,
+):
+    """Return diagnostics for a given lean file, provided its absolute path.
+
+    If return_lemmas_list is True and the proof is correct, also returns
+    'mathlib_lemmas': a sorted list of fully-qualified Lean declaration names
+    (e.g. "Nat.add_comm", "Finset.sum_comm") for every Mathlib lemma explicitly
+    cited in the source code.  These names are globally unique and suitable for
+    accumulating in a set to count distinct lemmas used.
+    """
     global lean_directory
 
     def error_return(error_str: str):
@@ -204,7 +282,20 @@ async def lean_check_file(absolute_file_path: str):
         return error_return(f"The provided path {file_path} is not in the correct directory: {lean_directory}")
     with open(file_path, "r") as f:
         lean_code = f.read()
-    return await _run_lean_code(lean_code)
+
+    result = await _run_lean_code(lean_code)
+
+    if not result["is_valid"] or not return_lemmas_list:
+        return result
+
+    # Proof is valid — verify which explicitly cited names are Mathlib declarations.
+    # This uses the already-cached import Mathlib REPL, so it is much cheaper than
+    # re-running the proof.
+    candidates = _extract_candidate_lemma_names(lean_code)
+    verification_code = "import Mathlib\n\n" + _build_verification_snippet(candidates)
+    verification_result = await _run_lean_code(verification_code)
+    result["mathlib_lemmas"] = _parse_lemmas_from_response(verification_result["repl_response"])
+    return result
 
 @mcp.tool()
 async def rg_in_mathlib(pattern: str, file_glob_pattern: Optional[str] = None):
