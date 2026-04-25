@@ -166,7 +166,7 @@ async def lean_write_file(
     file_name: Annotated[str, Field(description="An explicit name for the created file")],
     trajectory_id: str = "no_trajectory_id",
 ) -> str:
-    """Write a Lean file"""
+    """Write a Lean file and compile it"""
     global lean_directory
 
     if not file_name.endswith(".lean"):
@@ -180,9 +180,13 @@ async def lean_write_file(
     try:
         file_path.parent.mkdir(parents=True, exist_ok=True)
         file_path.write_text(code, encoding="utf-8")
-        return f"Successfully wrote to Lean project: {file_path.absolute()}"
     except Exception as e:
         return f"Failed to write to project: {str(e)}"
+
+    with open(file_path, "r") as f:
+        lean_code = f.read()
+    compile_result = await _run_lean_code(lean_code)
+    return f"Successfully wrote to Lean project: {file_path.absolute()}, result of the Lean evaluation: {compile_result}"
     
 def _extract_candidate_lemma_names(lean_code: str) -> list[str]:
     """Extract candidate Mathlib lemma names explicitly written in Lean source code.
