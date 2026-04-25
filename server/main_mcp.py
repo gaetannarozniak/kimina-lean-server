@@ -276,12 +276,6 @@ async def lean_check_file(
     return_lemmas_list: bool = False,
 ):
     """Return diagnostics for a given lean file, provided its absolute path.
-
-    If return_lemmas_list is True and the proof is correct, also returns
-    'mathlib_lemmas': a sorted list of fully-qualified Lean declaration names
-    (e.g. "Nat.add_comm", "Finset.sum_comm") for every Mathlib lemma explicitly
-    cited in the source code.  These names are globally unique and suitable for
-    accumulating in a set to count distinct lemmas used.
     """
     global lean_directory
 
