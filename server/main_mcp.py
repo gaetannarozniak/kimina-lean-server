@@ -21,8 +21,9 @@ from server.errors import ReplError, LeanError
 
 logger = logging.getLogger("kimina-client")
 
-settings = Settings(max_repl_mem=32, max_repls=32)
-lean_directory = Path.home().resolve() / "model_generated_files"
+settings = Settings(max_repl_mem=64, max_repls=64)
+# lean_directory = Path.home().resolve() / "model_generated_files"
+lean_directory = Path("/checkpoint/scientific-reasoning/gaetan/model_generated_files")
 
 MATHLIB_DIR = (Path.cwd() / "mathlib4").resolve(strict = True)
 
